@@ -1,0 +1,100 @@
+name: freebsd-webkit
+
+# Builds the FreeBSD (aarch64 + amd64) bun-webkit static-JSC tarballs and publishes them as
+# release assets named bun-webkit-freebsd-<arch>.tar.gz -- the exact names the FreeBSD
+# lang/bun port consumes from an `autobuild-<sha>` release.
+#
+# The source is whatever this branch points at. Branch `freebsd-webkit` is the WebKit commit
+# the port pins (2e2aa2290fac856d6f451ceacb58f7f5b44dd057) plus the FreeBSD membarrier
+# instruction-cache-barrier fix in Source/JavaScriptCore/wasm/WasmMachineThreads.cpp.
+#
+# Why here and not oven-sh's ci.yml: that workflow builds every lane on the self-hosted
+# `linux-x64-gh` runner, which a fork has no access to. This builds only the two FreeBSD
+# lanes, on GitHub-hosted runners.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - freebsd-webkit
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: freebsd-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            freebsd_arch: aarch64
+            march: ""
+          - arch: amd64
+            freebsd_arch: x86_64
+            march: "-march=nehalem"
+    steps:
+      - uses: actions/checkout@v4
+
+      # A standard runner has little free disk and the WebKit build is large.
+      - name: Free up disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      # The Dockerfile needs BuildKit (RUN --mount=type=tmpfs), and `-o type=tar` needs the
+      # docker-container driver.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build WebKit (${{ matrix.arch }})
+        run: |
+          docker buildx build -f Dockerfile.freebsd.arm64 \
+            --build-arg LLVM_VERSION=21 \
+            --build-arg WEBKIT_RELEASE_TYPE=Release \
+            --build-arg FREEBSD_ARCH=${{ matrix.freebsd_arch }} \
+            --build-arg FREEBSD_VERSION=14.3 \
+            --build-arg MARCH_FLAG="${{ matrix.march }}" \
+            --target artifact \
+            -o type=tar,dest=webkit-${{ matrix.arch }}.tar .
+
+      - name: Package under bun-webkit/
+        run: |
+          mkdir -p wrap/bun-webkit
+          tar xf webkit-${{ matrix.arch }}.tar -C wrap/bun-webkit
+          tar czf bun-webkit-freebsd-${{ matrix.arch }}.tar.gz -C wrap bun-webkit
+          ls -la bun-webkit-freebsd-${{ matrix.arch }}.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bun-webkit-freebsd-${{ matrix.arch }}
+          path: bun-webkit-freebsd-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          tag="autobuild-${{ github.sha }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/*.tar.gz --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" --target "${{ github.sha }}" \
+              --notes "FreeBSD bun-webkit for ${{ github.sha }} (WebKit commit 2e2aa2290fac856d6f451ceacb58f7f5b44dd057 + the FreeBSD membarrier icache-barrier fix)."
+          fi
